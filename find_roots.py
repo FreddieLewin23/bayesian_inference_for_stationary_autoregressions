@@ -2,6 +2,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import yfinance as yf
+from check_order_stationarity import _ols, _gaussian_ic, _lagged_matrix, _companion_and_eigs
 
 @dataclass
 class ARDiagnostics:
@@ -37,35 +38,7 @@ def ar_order_and_stationarity(
     y = y[~np.isnan(y)]
     if y.size < 5:
         raise ValueError("Need at least 5 observations after dropping NaNs.")
-    y_fit = y.copy()
-
-    def lagged(y_arr: np.ndarray, p_: int):
-        if p_ == 0:
-            return y_arr.copy(), np.empty((y_arr.shape[0], 0))
-        T = len(y_arr)
-        y_p = y_arr[p_:].copy()
-        X_p = np.column_stack([y_arr[p_ - i:T - i] for i in range(1, p_ + 1)])
-        return y_p, X_p
-
-    def ols(y_arr: np.ndarray, X_arr: np.ndarray):
-        n_eff = len(y_arr)
-        if X_arr.size == 0:
-            resid = y_arr
-            sigma2 = float(np.dot(resid, resid) / n_eff)
-            return np.empty(0), resid, sigma2, n_eff
-        beta, *_ = np.linalg.lstsq(X_arr, y_arr, rcond=None)
-        resid = y_arr - X_arr @ beta
-        sigma2 = float(np.dot(resid, resid) / n_eff)  # ML variance
-        return beta, resid, sigma2, n_eff
-
-    def gaussian_ic(s2: float, n_eff: int, k: int):
-        # logL up to additive constant: -n/2 * log(sigma^2)
-        s2 = max(s2, 1e-300)
-        logL = -0.5 * n_eff * (np.log(2*np.pi) + 1.0 + np.log(s2))
-        aic = -2.0*logL + 2.0*k
-        bic = -2.0*logL + k * np.log(max(n_eff, 2))
-        hq  = -2.0*logL + 2.0*k * np.log(np.log(max(n_eff, 3)))
-        return {"aic": float(aic), "bic": float(bic), "hqic": float(hq)}
+    y_fit = y.copy()  
 
     T = len(y_fit)
     max_p = int(min(max_p, T - 2))
@@ -73,9 +46,9 @@ def ar_order_and_stationarity(
 
     best = None
     for p_try in range(max_p + 1):
-        y_p, X_p = lagged(y_fit, p_try)
-        phi_hat, resid, sigma2, n_eff = ols(y_p, X_p)
-        ics = gaussian_ic(sigma2, n_eff, k=p_try)  # k=p (no intercept)
+        y_p, X_p = _lagged_matrix(y_fit, p_try)
+        phi_hat, resid, sigma2, n_eff = _ols(y_p, X_p)
+        ics = _gaussian_ic(sigma2, n_eff, k=p_try)  # k=p (no intercept)
         rec = {
             "p": p_try,
             "phi": None if p_try == 0 else phi_hat,
