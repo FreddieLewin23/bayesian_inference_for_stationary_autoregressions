@@ -7,6 +7,9 @@ from typing import Optional
 from dataclasses import dataclass
 from gibbs_pacf import plot_gibbs_pacf_traces
 from matplotlib import pyplot as plt
+from learning_the_mean import plot_gibbs_pacf_traces
+from scipy import linalg
+
 
 @dataclass
 class GibbsPACFConfigMean:
@@ -26,20 +29,105 @@ class GibbsPACFConfigMean:
 
 
 def gibbs_ar_pacf_with_mean(y: np.ndarray, cfg: GibbsPACFConfigMean):
+    """
+    Correct version that uses the exact likelihood under stationarity:
+      y_{p+1:n} | y_{1:p}, (kappa, mu, sigma2)  ~ N(X phi + c mu 1, sigma2 I)
+      y_{1:p}   | (kappa, mu, sigma2)          ~ N_p(mu 1_p, V(kappa,sigma2))
+    where V(kappa,sigma2) = sigma2 * P0(phi) and P0 solves the discrete Lyapunov equation.
+    """
     rng = np.random.default_rng(cfg.rng_seed)
     y = np.asarray(y, float).ravel()
-    y_p, X = _lagged_matrix(y, cfg.p)  # y_p shape (n*,), X shape (n*, p)
+
+    # data splits
+    y_p, X = _lagged_matrix(y, cfg.p)  # y_p = y[p:], X uses lags from y
     n_star, p = X.shape
+    y_init = y[:p].copy()             # y_{1:p}
+
+    # --- helpers
+    alpha, beta = cfg.alpha_beta_prior
+    ones_star = np.ones(n_star)
+    ones_p = np.ones(p)
+
+    def log_prior_kappa(k: np.ndarray) -> float:
+        # independent scaled Beta on each kappa_j via x=(k+1)/2 in (0,1)
+        x = 0.5 * (k + 1.0)
+        # constant Jacobian from scaling (1/2)^p cancels in MH ratio, so omit
+        return float(np.sum(beta_dist.logpdf(x, alpha, beta)))
+
+    def c_from_phi(ph: np.ndarray) -> float:
+        return float(1.0 - np.sum(ph))
+
+    def companion_A(phi: np.ndarray) -> np.ndarray:
+        # state s_t = [x_t, x_{t-1}, ..., x_{t-p+1}]', where x_t = y_t - mu
+        # x_t = phi' [x_{t-1},...,x_{t-p}] + eps_t
+        A = np.zeros((p, p), dtype=float)
+        A[0, :] = phi
+        if p > 1:
+            A[1:, :-1] = np.eye(p - 1)
+        return A
+
+    def stationary_P0(phi: np.ndarray) -> np.ndarray:
+        """
+        Solve P = A P A' + Q with Q = e1 e1' (i.e., innovation variance = 1).
+        Then for general sigma2: P(sigma2) = sigma2 * P0.
+        """
+        A = companion_A(phi)
+        Q = np.zeros((p, p), dtype=float)
+        Q[0, 0] = 1.0
+        # SciPy solves A X A^T - X + Q = 0  -> X = A X A^T + Q
+        P0 = linalg.solve_discrete_lyapunov(A, Q)
+        return P0
+
+    def quad_and_logdet_init(phi: np.ndarray, mu: float, sigma2: float):
+        """
+        For y_init ~ N_p(mu 1, V), V = sigma2 * P0(phi)
+        Return:
+          quad = (y_init - mu 1)' V^{-1} (y_init - mu 1)
+          logdetV = log|V|
+          also return P0^{-1} and logdetP0 to reuse in mu/sigma2 steps.
+        """
+        P0 = stationary_P0(phi)
+        # numerically stable inverse + logdet via Cholesky if possible
+        try:
+            L = np.linalg.cholesky(P0)
+            logdetP0 = 2.0 * np.sum(np.log(np.diag(L)))
+            # solve P0^{-1} b via cho_solve
+            P0_inv = linalg.cho_solve((L, True), np.eye(p))
+        except np.linalg.LinAlgError:
+            sign, logdetP0 = np.linalg.slogdet(P0)
+            if sign <= 0:
+                raise ValueError("P0 not SPD; phi may be non-stationary or numerical issues.")
+            P0_inv = np.linalg.inv(P0)
+
+        d = (y_init - mu * ones_p)
+        quad = (d @ P0_inv @ d) / sigma2                # because V^{-1} = (1/sigma2) P0^{-1}
+        logdetV = p * np.log(sigma2) + logdetP0
+        return float(quad), float(logdetV), P0_inv, float(logdetP0)
+
+    def loglike_conditional(phi: np.ndarray, mu: float, sigma2: float) -> float:
+        c = c_from_phi(phi)
+        resid = (y_p - X @ phi) - c * mu * ones_star
+        return float(-0.5 * np.sum(resid ** 2) / sigma2)
+
+    def loglike_initial(phi: np.ndarray, mu: float, sigma2: float) -> float:
+        quad, logdetV, _, _ = quad_and_logdet_init(phi, mu, sigma2)
+        return float(-0.5 * (quad + logdetV))
+
+    def logpost_kappa(phi: np.ndarray, kappa: np.ndarray, mu: float, sigma2: float) -> float:
+        # posterior in kappa up to constant, using exact likelihood
+        return (
+            log_prior_kappa(kappa)
+            + loglike_conditional(phi, mu, sigma2)
+            + loglike_initial(phi, mu, sigma2)
+        )
 
     # --- initialise
     kappa = np.zeros(p)
     z = kappa_to_z(kappa)
     phi = pacf_to_phi(kappa)
 
-    mu = float(np.mean(y_p))  # reasonable init
-    sigma2 = float(np.var(y_p))
-
-    alpha, beta = cfg.alpha_beta_prior
+    mu = float(np.mean(y))  # reasonable init
+    sigma2 = float(np.var(y, ddof=1))
 
     n_save = (cfg.n_iter - cfg.burn) // cfg.thin
     kappa_samps = np.empty((n_save, p))
@@ -50,71 +138,71 @@ def gibbs_ar_pacf_with_mean(y: np.ndarray, cfg: GibbsPACFConfigMean):
     total_proposals = 0
     save_i = 0
 
-    ones = np.ones(n_star)
-
-    def log_prior_kappa(k: np.ndarray) -> float:
-        # scaled Beta prior on each component: x=(k+1)/2 in (0,1)
-        x = 0.5 * (k + 1.0)
-        return float(np.sum(beta_dist.logpdf(x, alpha, beta)))
-
-    def c_from_phi(ph: np.ndarray) -> float:
-        # c(phi) = 1 - sum_j phi_j
-        return float(1.0 - np.sum(ph))
-
     for it in range(cfg.n_iter):
 
         # ---------- Step 1: MH for kappa (via z), conditional on (mu, sigma2)
         total_proposals += 1
 
-        c_curr = c_from_phi(phi)
-        # e = (y - X phi) - c(phi)*mu*1
-        resid_curr = (y_p - X @ phi) - c_curr * mu * ones
-        ll_curr = -0.5 * np.sum(resid_curr**2) / sigma2
-        lp_curr = log_prior_kappa(kappa)
+        # target in z-space: log p(kappa(z) | ...) + log|dkappa/dz|
+        # if kappa = tanh(z), then log|dkappa/dz| = sum log(1 - kappa^2)
+        kappa_curr = kappa
+        phi_curr = phi
+        logt_curr = logpost_kappa(phi_curr, kappa_curr, mu, sigma2) + float(np.sum(np.log(1.0 - kappa_curr**2)))
 
         # propose in z-space
         z_prop = z + rng.normal(0.0, cfg.prop_sd, size=p)
         kappa_prop = z_to_kappa(z_prop)
         phi_prop = pacf_to_phi(kappa_prop)
+        logt_prop = logpost_kappa(phi_prop, kappa_prop, mu, sigma2) + float(np.sum(np.log(1.0 - kappa_prop**2)))
 
-        c_prop = c_from_phi(phi_prop)
-        resid_prop = (y_p - X @ phi_prop) - c_prop * mu * ones
-        ll_prop = -0.5 * np.sum(resid_prop**2) / sigma2
-        lp_prop = log_prior_kappa(kappa_prop)
-
-        # Jacobian term for transformation kappa -> z
-        log_jac_curr = -1.5 * np.sum(np.log(1.0 - kappa**2))
-        log_jac_prop = -1.5 * np.sum(np.log(1.0 - kappa_prop**2))
-        log_q_ratio = log_jac_curr - log_jac_prop
-
-        log_acc_ratio = (ll_prop + lp_prop) - (ll_curr + lp_curr) + log_q_ratio
+        log_acc_ratio = logt_prop - logt_curr
 
         if np.log(rng.uniform()) < log_acc_ratio:
             kappa = kappa_prop
             z = z_prop
             phi = phi_prop
             accept_count += 1
-            c_curr = c_prop  # keep in sync
+        else:
+            # keep current
+            phi = phi_curr
+            kappa = kappa_curr
 
-        # ---------- Step 2: Gibbs for mu | (kappa, sigma2, y)
-        # Using r = y - X phi, and model r - N(c(phi)*mu*1, sigma2 I)
+        # ---------- Step 2: Gibbs for mu | (kappa, sigma2, y)  (exact)
         c_curr = c_from_phi(phi)
+
+        # conditional part: r = y_{p+1:n} - X phi = c mu 1 + eps
         r = y_p - X @ phi
         S = float(np.sum(r))
 
-        # posterior variance and mean:
-        # V_mu = (1/c2 + n* c^2 / sigma2)^(-1)
-        # m_mu = V_mu * (mu0/c2 + c*S/sigma2)
-        prec = (1.0 / cfg.c2) + (n_star * (c_curr**2) / sigma2)
+        # initial block part: y_{1:p} ~ N_p(mu 1, sigma2 P0)
+        quad_dummy, logdet_dummy, P0_inv, _ = quad_and_logdet_init(phi, mu=0.0, sigma2=1.0)
+        # Note: quad_and_logdet_init with mu=0,sigma2=1 just to get P0_inv stably (quad/logdet ignored)
+        # This is safe because P0_inv depends only on phi.
+
+        one_P0inv_one = float(ones_p @ P0_inv @ ones_p)
+        one_P0inv_yinit = float(ones_p @ P0_inv @ y_init)
+
+        # prior: mu ~ N(mu0, c2)
+        prec = (1.0 / cfg.c2) + (n_star * (c_curr**2) / sigma2) + (one_P0inv_one / sigma2)
         V_mu = 1.0 / prec
-        m_mu = V_mu * ((cfg.mu0 / cfg.c2) + (c_curr * S / sigma2))
+        m_mu = V_mu * ((cfg.mu0 / cfg.c2) + (c_curr * S / sigma2) + (one_P0inv_yinit / sigma2))
 
         mu = float(rng.normal(m_mu, np.sqrt(V_mu)))
 
-        # ---------- Step 3: Gibbs for sigma2 | (kappa, mu, y)
-        resid = r - c_curr * mu * ones
-        an = cfg.a0 + 0.5 * n_star
-        bn = cfg.b0_ig + 0.5 * float(np.sum(resid**2))
+        # ---------- Step 3: Gibbs for sigma2 | (kappa, mu, y)  (exact)
+        # conditional residuals
+        resid_star = (y_p - X @ phi) - c_curr * mu * ones_star
+        ss_star = float(np.sum(resid_star ** 2))
+
+        # initial block quadratic with V^{-1} = (1/sigma2) P0^{-1}, and log|V| contributes p*log(sigma2)
+        # For the sigma2 conditional, we need d'P0^{-1}d term:
+        d_init = (y_init - mu * ones_p)
+        ss_init = float(d_init @ P0_inv @ d_init)
+
+        # IG update: likelihood contributes sigma2^{-(n_star/2)} exp(-ss_star/(2 sigma2))
+        # and initial MVN contributes sigma2^{-(p/2)} exp(-ss_init/(2 sigma2))
+        an = cfg.a0 + 0.5 * (n_star + p)
+        bn = cfg.b0_ig + 0.5 * (ss_star + ss_init)
         sigma2 = 1.0 / rng.gamma(an, 1.0 / bn)
 
         # ---------- save
@@ -132,64 +220,6 @@ def gibbs_ar_pacf_with_mean(y: np.ndarray, cfg: GibbsPACFConfigMean):
         sigma2_samples=sigma2_samps,
         accept_rate=accept_rate,
     )
-
-
-
-def plot_gibbs_pacf_traces(
-    res: dict,
-    true_kappa: np.ndarray = None,
-    true_mu: float = None,
-    true_phi: np.ndarray = None,
-    true_sigma2: float = None,
-    figsize: tuple = (10, 6),
-    savepath: str = '/Users/FreddieLewin/Desktop/dissertation/plots/jacobian_pacf_traces3.png'
-):
-
-    kappa_samps = res["kappa_samples"]
-    sigma2_samps = res["sigma2_samples"]
-    mu_samps = res.get("mu_samples", None)
-
-    p = kappa_samps.shape[1]
-    has_mu = mu_samps is not None
-    n_axes = p + (2 if has_mu else 1)
-
-    fig, axes = plt.subplots(n_axes, 1, figsize=figsize, sharex=False)
-
-    # If only one axis, make it indexable
-    if n_axes == 1:
-        axes = [axes]
-
-    # Plot each kappa trace
-    for i in range(p):
-        axes[i].plot(kappa_samps[:, i], lw=0.7, color="tab:blue")
-        if true_kappa is not None:
-            axes[i].axhline(true_kappa[i], ls="--", color="red", lw=1)
-        axes[i].set_title(f"Trace: κ{i+1}")
-        axes[i].set_ylabel("value")
-
-    next_row = p
-
-    # Plot mu trace if present
-    if has_mu:
-        axes[next_row].plot(mu_samps, lw=0.7, color="tab:green")
-        if true_mu is not None:
-            axes[next_row].axhline(true_mu, ls="--", color="red", lw=1)
-        axes[next_row].set_title("Trace: μ")
-        axes[next_row].set_ylabel("value")
-        next_row += 1
-
-    # Plot sigma² trace
-    axes[next_row].plot(sigma2_samps, lw=0.7, color="tab:orange")
-    if true_sigma2 is not None:
-        axes[next_row].axhline(true_sigma2, ls="--", color="red", lw=1)
-    axes[next_row].set_title("Trace: σ2")
-    axes[next_row].set_ylabel("value")
-    axes[next_row].set_xlabel("iteration")
-
-    plt.tight_layout()
-    if savepath is not None:
-        plt.savefig(savepath)
-    plt.show()
 
 
 if __name__ == "__main__":
@@ -221,9 +251,9 @@ if __name__ == "__main__":
 
     cfg = GibbsPACFConfigMean(
         p=3,
-        n_iter=10000,
+        n_iter=30000,
         burn=1000,
-        thin=10,
+        thin=1,
         prop_sd=0.01,
         rng_seed=42,
         mu0=0.0,
@@ -242,9 +272,10 @@ if __name__ == "__main__":
         true_mu=true_mu,
         true_sigma2=true_sigma2,
         figsize=(10, 10),
-        savepath='/Users/FreddieLewin/Desktop/dissertation/plots/jacobian_pacf_traces_with_mu.png'
+        savepath='/Users/FreddieLewin/Desktop/dissertation/plots/conditional_likelihood_change_PACF_mu.png'
     )
 
+    plt.show()
 
 
 
