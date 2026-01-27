@@ -2,5 +2,6 @@
 MMath, Durham University, Project IV. 
 Advisor: Dr Sarah Heaps, Associate Professor, Durham University
 
-This project, prodominately done in Python, explores the use of Hidden Markov Models, Markov Chain Monte Carlo (PyMC), and Bayesian Inference in the context of sampling from stationary
-autoregressions. I want to apply the these sampling techniques to Trading Strategies similar to my previous projects to generate alpha.
+Bayesian inference for stationary autoregressive AR(p) time series models using a partial autocorrelation (PACF) parameterisation to enforce stationarity by construction. This project implements custom MCMC algorithms (Gibbs sampling with Metropolis Hastings steps) under the exact Gaussian likelihood for stationary processes, including the correct treatment of the initial observations via the discrete Lyapunov equation. Both unknown-mean and zero-mean AR models are supported, with conjugate updates for the mean and variance and PACF-based proposals that respect the stationarity region.
+
+The repository also includes a Stan implementation of the same PACF model for comparison with Hamiltonian Monte Carlo, tools for model order selection using AIC, BIC and HQIC, and stationarity diagnostics based on companion matrix eigenvalues and characteristic polynomial roots. Core components include Levinson recursion for PACF to AR conversion, stationary covariance computation, and numerical linear algebra for stable likelihood evaluation. The codebase demonstrates advanced time series theory, Bayesian computation, constrained parameter inference, and practical MCMC design relevant to quantitative finance and statistical research.
